@@ -50,28 +50,151 @@ const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 // --- Assets ---
 const CUSTOM_LOGO_URL = null; 
 
+// --- Constants ---
+const ACCENT_COLOR = "text-[#fa233b]"; 
+const SAAVN_APIS = ["https://saavn.dev/api", "https://saavn.me"]; // Multiple endpoints for redundancy
+const ITUNES_API = "https://itunes.apple.com/search";
+
 // --- Utils ---
-const formatTime = (millis) => {
-  if (!millis && millis !== 0) return "0:00";
-  const totalSeconds = Math.floor(millis / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = (totalSeconds % 60).toFixed(0);
-  return minutes + ":" + (parseInt(seconds) < 10 ? '0' : '') + seconds;
+const formatTime = (seconds) => {
+  if (!seconds && seconds !== 0) return "0:00";
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return mins + ":" + (secs < 10 ? '0' : '') + secs;
 };
 
+// --- DATA MAPPING ---
+
+// 1. iTunes Mapper (Primary Metadata Source)
 const mapItunesTrack = (track) => ({
   id: track.trackId,
   title: track.trackName,
   artist: track.artistName,
   album: track.collectionName,
   cover: track.artworkUrl100 ? track.artworkUrl100.replace('100x100', '600x600') : null,
-  duration: formatTime(track.trackTimeMillis), 
+  duration: formatTime(track.trackTimeMillis / 1000), // Convert ms to seconds
   previewUrl: track.previewUrl, 
-  releaseDate: track.releaseDate
+  releaseDate: track.releaseDate,
+  source: 'itunes'
 });
 
-// --- Constants ---
-const ACCENT_COLOR = "text-[#fa233b]"; 
+// 2. Saavn Mapper (Full Songs - Fallback Audio)
+const mapSaavnTrack = (track) => {
+    if (!track) return null;
+    const getImage = (images) => {
+        if (!images) return null;
+        if (typeof images === 'string') return images;
+        if (Array.isArray(images) && images.length > 0) {
+            const obj = images[images.length - 1];
+            return obj.url || obj.link; 
+        }
+        return null;
+    };
+    const getDownloadUrl = (urls) => {
+        if (!urls) return null;
+        if (typeof urls === 'string') return urls;
+        if (Array.isArray(urls) && urls.length > 0) {
+            const obj = urls[urls.length - 1];
+            return obj.url || obj.link; 
+        }
+        return null;
+    };
+    const getArtist = (artistData) => {
+        if (typeof artistData === 'string') return artistData;
+        if (track.primaryArtists) return track.primaryArtists;
+        return "Unknown Artist";
+    };
+
+    return {
+        id: track.id,
+        title: track.name?.replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, "&") || "Unknown Title",
+        artist: getArtist(track.primaryArtists),
+        album: track.album?.name || track.album || "Single",
+        cover: getImage(track.image),
+        duration: formatTime(track.duration), // Saavn sends seconds
+        previewUrl: getDownloadUrl(track.downloadUrl), 
+        releaseDate: track.year || track.releaseDate,
+        source: 'saavn'
+    };
+};
+
+// --- API HELPERS ---
+
+// A. iTunes Data Fetcher (Primary)
+const fetchItunesData = async (queryTerm) => {
+    try {
+        const res = await fetch(`${ITUNES_API}?term=${encodeURIComponent(queryTerm)}&media=music&entity=song&limit=25`);
+        if (res.ok) {
+            const data = await res.json();
+            return data.results.map(mapItunesTrack);
+        }
+    } catch (e) {
+        console.error("iTunes Fetch Error", e);
+    }
+    return [];
+};
+
+// B. Saavn Data Fetcher (Used for Audio Resolution)
+const fetchSaavnData = async (queryTerm) => {
+    const cleanQuery = encodeURIComponent(queryTerm);
+    
+    // Iterate through available APIs to find one that works
+    for (const base of SAAVN_APIS) {
+        const url = `${base}/search/songs?query=${cleanQuery}&limit=5`;
+        
+        // Strategy 1: Direct Fetch
+        try {
+            const res = await fetch(url);
+            if (res.ok) {
+                const data = await res.json();
+                // Handle different response structures
+                const results = data.data?.results || data.results || [];
+                if (results.length > 0) {
+                    return results.map(mapSaavnTrack).filter(t => t && t.previewUrl);
+                }
+            }
+        } catch (e) {
+            // console.warn(`Direct fetch failed for ${base}`, e);
+        }
+
+        // Strategy 2: Proxy Fetch (corsproxy.io)
+        try {
+            const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+            const res = await fetch(proxyUrl);
+            if (res.ok) {
+                const data = await res.json();
+                const results = data.data?.results || data.results || [];
+                if (results.length > 0) {
+                    return results.map(mapSaavnTrack).filter(t => t && t.previewUrl);
+                }
+            }
+        } catch (e) {
+            // console.warn(`Proxy fetch failed for ${base}`, e);
+        }
+    }
+    
+    return [];
+};
+
+// C. Audio Resolver (The Bridge)
+// Takes an iTunes track, finds the full audio on Saavn if possible
+const resolveAudioUrl = async (track) => {
+    // If it's already a Saavn track with a full URL
+    if (track.source === 'saavn' && track.previewUrl) return track.previewUrl;
+    
+    // If iTunes, try to find full version on Saavn
+    console.log("Resolving full audio for:", track.title);
+    const searchTerms = `${track.title} ${track.artist}`; 
+    const matches = await fetchSaavnData(searchTerms);
+    
+    if (matches && matches.length > 0) {
+        // Use the first match from Saavn
+        return matches[0].previewUrl;
+    }
+    
+    // Fallback to existing iTunes previewUrl (30s) if resolution failed
+    return track.previewUrl;
+};
 
 // --- Components ---
 
@@ -391,8 +514,8 @@ const SidebarItem = ({ icon: Icon, label, active, onClick, locked }) => (
   </button>
 );
 
-const Sidebar = ({ currentView, setView, isGuest, requestLogin, theme, toggleTheme }) => (
-  <div className="hidden md:flex flex-col w-64 bg-[var(--bg-sidebar)] border-r border-[var(--border)] p-4 pt-8 h-full z-30">
+const Sidebar = ({ currentView, setView, isGuest, requestLogin, theme, toggleTheme, hasPlayer }) => (
+  <div className={`hidden md:flex flex-col w-64 bg-[var(--bg-sidebar)] border-r border-[var(--border)] px-4 pt-8 h-full z-30 transition-[padding] duration-300 ${hasPlayer ? 'pb-[104px]' : 'pb-4'}`}>
     <div className="mb-8 px-3">
         <BrandLogo />
     </div>
@@ -491,7 +614,7 @@ const FullscreenPlayer = ({
                     <span className="text-sm font-bold text-white">{currentTrack.album || "Unknown Album"}</span>
                 </div>
                 <button 
-                    onClick={() => setShowQueue(!showQueue)}
+                    onClick={() => setShowQueue(!showQueue)} 
                     className={`transition p-2 rounded-full ${showQueue ? 'bg-[#fa233b] text-white' : 'text-gray-400 hover:text-white'}`}
                 >
                     <ListMusic size={24} />
@@ -586,7 +709,7 @@ const FullscreenPlayer = ({
                         max="100" 
                         value={volume} 
                         onChange={(e) => setVolume(parseFloat(e.target.value))}
-                        className="w-full h-1 bg-white/20 rounded-full appearance-none cursor-pointer accent-white hover:accent-[#fa233b]"
+                        className="w-full h-1 bg-white/20 rounded-full appearance-none cursor-pointer accent-white hover:accent-[#fa233b]" 
                     />
                 </div>
             </div>
@@ -620,41 +743,34 @@ const PlayerBar = ({
   }, []);
 
   const handleEnterFullscreen = () => {
-    // Attempt to enter browser fullscreen
-    if (document.documentElement.requestFullscreen) {
-      document.documentElement.requestFullscreen().catch((err) => {
-        console.error("Error attempting to enable fullscreen:", err);
-        // Fallback: just show the overlay if API fails
-        setShowFullscreen(true);
-      });
-    } else {
-      setShowFullscreen(true);
-    }
+    // Rely on CSS-based immersive overlay instead of native fullscreen API
+    // This bypasses permission policy restrictions in iframes
+    setShowFullscreen(true);
   };
 
   const handleExitFullscreen = () => {
-    // Attempt to exit browser fullscreen
-    if (document.exitFullscreen && document.fullscreenElement) {
-      document.exitFullscreen().catch((err) => console.error("Error attempting to exit fullscreen:", err));
-    } else {
-      setShowFullscreen(false);
-    }
+    setShowFullscreen(false);
   };
 
   useEffect(() => {
     const audio = audioRef.current;
     if (!currentTrack || !audio) return;
 
+    // Check if the source actually changed to prevent reloading
     if (audio.src !== currentTrack.previewUrl) {
-      audio.src = currentTrack.previewUrl;
-      audio.load();
-      if (isPlaying) audio.play().catch(e => console.error(e));
+      if(currentTrack.previewUrl) {
+          audio.src = currentTrack.previewUrl;
+          audio.load();
+          if (isPlaying) audio.play().catch(e => console.error("Audio play error:", e));
+      }
     } else {
-      isPlaying ? audio.play() : audio.pause();
+      // Just toggle play state
+      isPlaying ? audio.play().catch(e => console.error("Audio play error:", e)) : audio.pause();
     }
 
-    const updateTime = () => setCurrentTime(audio.currentTime * 1000);
-    const updateDuration = () => setDuration(audio.duration * 1000);
+    // UPDATED: Store seconds directly, do not multiply by 1000
+    const updateTime = () => setCurrentTime(audio.currentTime); 
+    const updateDuration = () => setDuration(audio.duration);
     const handleEnded = () => {
         if (isRepeat) {
             audio.currentTime = 0;
@@ -694,7 +810,8 @@ const PlayerBar = ({
             onNext={onNext}
             onPrev={onPrev}
             progress={progress}
-            currentTime={formatTime(currentTime)}
+            // UPDATED: Pass seconds directly to formatTime
+            currentTime={formatTime(currentTime)} 
             duration={formatTime(duration)}
             onLike={onLike}
             isLiked={isLiked}
@@ -708,7 +825,7 @@ const PlayerBar = ({
             onPlayTrack={onPlayTrack}
         />
 
-        <div className="fixed bottom-16 md:bottom-0 left-0 right-0 h-16 md:h-[88px] bg-[var(--bg-surface-1)]/95 backdrop-blur-md border-t border-[var(--border)] flex items-center px-4 md:px-6 z-50 shadow-2xl transition-all">
+        <div className="fixed bottom-16 md:bottom-0 left-0 right-0 h-16 md:h-[88px] bg-[var(--bg-sidebar)] border-t border-[var(--border)] flex items-center px-4 md:px-6 z-50 shadow-2xl transition-all">
         <QueueOverlay isOpen={showQueue} currentTrack={currentTrack} queue={queue} onClose={() => setShowQueue(false)} onPlayTrack={onPlayTrack} />
         
         {/* Track Info */}
@@ -764,6 +881,7 @@ const PlayerBar = ({
             </div>
             
             <div className="w-full flex items-center gap-3 text-[10px] text-[var(--text-secondary)] font-medium hidden md:flex">
+                {/* UPDATED: Pass seconds directly */}
                 <span className="w-8 text-right">{formatTime(currentTime)}</span>
                 <div className="relative flex-1 h-[3px] bg-[var(--bg-surface-3)] rounded-full overflow-hidden group cursor-pointer">
                     <div 
@@ -828,10 +946,9 @@ const RadioView = ({ onPlayTrack, currentTrack, user, onAuth, isLoading }) => {
 
     const playStation = async (station) => {
         try {
-            const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(station.query)}&media=music&entity=song&limit=20`);
-            const data = await res.json();
-            const tracks = data.results.map(mapItunesTrack);
+            const tracks = await fetchItunesData(station.query);
             if(tracks.length > 0) {
+                // Shuffle start
                 const randomTrack = tracks[Math.floor(Math.random() * tracks.length)];
                 onPlayTrack(randomTrack, tracks);
             }
@@ -1051,9 +1168,9 @@ const HomeView = ({ onPlaylistClick, playlists, onPlayTrack, currentTrack, user,
     useEffect(() => {
         const fetchTrending = async () => {
             try {
-                const res = await fetch(`https://itunes.apple.com/search?term=top+hits&media=music&entity=song&limit=8`);
-                const data = await res.json();
-                setTrending(data.results.map(mapItunesTrack));
+                // Now using iTunes API for trending
+                const results = await fetchItunesData('top hits');
+                setTrending(results);
             } catch (e) {
                 console.error("Failed to fetch trending", e);
             }
@@ -1084,7 +1201,7 @@ const HomeView = ({ onPlaylistClick, playlists, onPlayTrack, currentTrack, user,
                     <h2 className="text-xl font-bold text-[var(--text-primary)] flex items-center gap-2"><Flame size={20} className="text-[#fa233b]" fill="#fa233b" /> Trending Now</h2>
                  </div>
                  <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
-                    {trending.map(song => (
+                    {trending.slice(0, 8).map(song => (
                         <div key={song.id} onClick={() => onPlayTrack(song, trending)} className={`flex items-center gap-3 p-2 md:p-3 rounded-lg bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)] cursor-pointer transition-colors group border border-transparent hover:border-[#fa233b]/30 ${currentTrack?.id === song.id ? 'border-[#fa233b]' : ''}`}>
                             <div className="relative w-10 h-10 md:w-12 md:h-12 shrink-0">
                                 <img src={song.cover} className="w-full h-full rounded-md object-cover" alt={song.title} />
@@ -1152,9 +1269,8 @@ const SearchView = ({ onPlayTrack, currentTrack, user, onAuth, isLoading }) => {
         if(!query) return;
         setSearching(true);
         try {
-            const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=15`);
-            const data = await res.json();
-            setResults(data.results.map(mapItunesTrack));
+            const tracks = await fetchItunesData(query);
+            setResults(tracks);
         } catch (err) {
             console.error(err);
         }
@@ -1382,29 +1498,37 @@ const App = () => {
     const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'playlists'));
     const unsub = onSnapshot(q, async (snap) => {
         if (snap.empty) {
-             const animeRes = await fetch('https://itunes.apple.com/search?term=anime%20opening&media=music&entity=song&limit=6');
-             const animeData = await animeRes.json();
-             const lofiRes = await fetch('https://itunes.apple.com/search?term=ghibli%20jazz&media=music&entity=song&limit=6');
-             const lofiData = await lofiRes.json();
-             
-             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'playlists'), {
-                title: "Anime Hits",
-                description: "Top openings and endings.",
-                cover: animeData.results[0]?.artworkUrl100?.replace('100x100','600x600'),
-                author: "Music App",
-                category: "J-Pop",
-                songs: animeData.results.map(mapItunesTrack),
-                createdAt: serverTimestamp()
-             });
-             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'playlists'), {
-                title: "Lofi Beats",
-                description: "Chill vibes for studying.",
-                cover: lofiData.results[0]?.artworkUrl100?.replace('100x100','600x600'),
-                author: "Music App",
-                category: "Chill",
-                songs: lofiData.results.map(mapItunesTrack),
-                createdAt: serverTimestamp()
-             });
+             try {
+                // Init with iTunes Data
+                const animeResults = await fetchItunesData('anime opening');
+                const lofiResults = await fetchItunesData('lofi chill');
+                
+                if(animeResults.length > 0) {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'playlists'), {
+                        title: "Anime Hits",
+                        description: "Top openings and endings.",
+                        cover: animeResults[0].cover,
+                        author: "Music App",
+                        category: "J-Pop",
+                        songs: animeResults,
+                        createdAt: serverTimestamp()
+                    });
+                }
+                
+                if(lofiResults.length > 0) {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'playlists'), {
+                        title: "Lofi Beats",
+                        description: "Chill vibes for studying.",
+                        cover: lofiResults[0].cover,
+                        author: "Music App",
+                        category: "Chill",
+                        songs: lofiResults,
+                        createdAt: serverTimestamp()
+                    });
+                }
+             } catch(e) {
+                 console.error("Failed to init playlists", e);
+             }
         } else {
             setPlaylists(snap.docs.map(d => ({id: d.id, ...d.data()})));
         }
@@ -1414,13 +1538,37 @@ const App = () => {
 
   const handlePlaylistClick = (id) => setView({ type: 'playlist', id });
   
-  const handlePlayTrack = (track, newQueue) => {
+  // REFACTORED PLAY HANDLER TO RESOLVE AUDIO
+  const handlePlayTrack = async (track, newQueue) => {
+    // If selecting same track, toggle play/pause
     if (currentTrack?.id === track.id) {
         setIsPlaying(!isPlaying);
-    } else {
-        setCurrentTrack(track);
-        setIsPlaying(true);
-        if(newQueue) setQueue(newQueue);
+        return;
+    }
+
+    // Set immediate UI feedback with metadata (even if audio isn't resolved yet)
+    // We clone the track so we don't mutate the original list object
+    const playingTrack = { ...track };
+    setCurrentTrack(playingTrack);
+    setIsPlaying(true);
+    if(newQueue) setQueue(newQueue);
+
+    // Resolve Audio if needed
+    try {
+        const audioUrl = await resolveAudioUrl(track);
+        if (audioUrl) {
+            // Update the current track state with the resolved URL
+            setCurrentTrack(prev => {
+                if (prev && prev.id === track.id) {
+                    return { ...prev, previewUrl: audioUrl };
+                }
+                return prev;
+            });
+        } else {
+            showToast("Could not find audio stream", "error");
+        }
+    } catch (e) {
+        console.error("Audio resolution failed", e);
     }
   };
 
@@ -1506,6 +1654,7 @@ const App = () => {
             requestLogin={() => setShowProfileModal(true)} 
             theme={theme}
             toggleTheme={toggleTheme}
+            hasPlayer={!!currentTrack}
         />
         
         {/* Main Content */}
